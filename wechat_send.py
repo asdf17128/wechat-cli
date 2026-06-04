@@ -246,22 +246,82 @@ def ensure_chat_list(sid: str) -> None:
 def find_chat_row(sid: str, target: str) -> str:
     """Find a chat list row whose label exactly matches target.
 
-    On WeChat's chat list each chat is a StaticText with the chat name as its
-    label/name. We scope to the chat list area (y < 700) so that an exact
-    match against a message bubble inside an already-opened chat doesn't win.
+    Tries three strategies in order:
+    1. Predicate on label/name (fastest, works most of the time)
+    2. Get all StaticText and filter in Python (bypasses any predicate bug)
+    3. Force-refresh accessibility tree by swiping the list, then retry (1)
+
+    The 2nd strategy matters because WDA's predicate evaluator occasionally
+    returns 0 matches when an alternative method walking the element tree
+    does find the same element — a known accessibility-snapshot issue.
+
+    Raises WeChatError(3) only after all 3 strategies exhaust.
     """
+    # Strategy 1: predicate.
+    elem = _find_chat_row_predicate(sid, target)
+    if elem:
+        return elem
+
+    # Strategy 2: enumerate StaticTexts, filter by attribute, scope by y.
+    elem = _find_chat_row_walk(sid, target)
+    if elem:
+        return elem
+
+    # Strategy 3: nudge the list (1 px scroll) to force WDA re-snapshot, retry.
+    try:
+        post(f"/session/{sid}/wda/dragfromtoforduration",
+             {"fromX": 200, "fromY": 400, "toX": 200, "toY": 401, "duration": 0.05},
+             timeout=5)
+        time.sleep(0.8)
+    except Exception:
+        pass
+    elem = _find_chat_row_predicate(sid, target) or _find_chat_row_walk(sid, target)
+    if elem:
+        return elem
+
+    # Diagnostic dump for debugging (only printed if no strategy worked).
+    cnt = len(find_all(sid, 'type == "XCUIElementTypeStaticText"'))
+    raise WeChatError(3, f"chat '{target}' not found in chat list "
+                         f"(0 candidates after 3 lookup strategies; "
+                         f"{cnt} total StaticText visible — accessibility tree may be stale)")
+
+
+def _find_chat_row_predicate(sid: str, target: str) -> str | None:
+    """Strategy 1: NSPredicate lookup."""
     candidates = find_all(
         sid,
         f'type == "XCUIElementTypeStaticText" AND (label == "{target}" OR name == "{target}")'
     )
+    return _filter_chat_list_y(sid, candidates)
+
+
+def _find_chat_row_walk(sid: str, target: str) -> str | None:
+    """Strategy 2: enumerate all StaticTexts, filter by label/name in Python."""
+    all_st = find_all(sid, 'type == "XCUIElementTypeStaticText"')
+    matches = []
+    for elem in all_st:
+        try:
+            r = get(f"/session/{sid}/element/{elem}/attribute/label")
+            label = r.get("value") or ""
+        except Exception:
+            label = ""
+        if label == target:
+            matches.append(elem)
+    return _filter_chat_list_y(sid, matches)
+
+
+def _filter_chat_list_y(sid: str, candidates: list[str]) -> str | None:
+    """From a list of candidate elements, return the first whose y is in the
+    chat-list area (between top bar and bottom nav)."""
     for elem in candidates:
-        rect = get_elem_rect(sid, elem)
-        y = rect.get("y", 0)
-        # Chat list rows live between top bar (~y=150) and bottom nav (~y=750).
-        if 130 <= y <= 700:
-            return elem
-    raise WeChatError(3, f"chat '{target}' not found in chat list "
-                         f"({len(candidates)} candidates, none in chat-list y-range)")
+        try:
+            rect = get_elem_rect(sid, elem)
+            y = rect.get("y", 0)
+            if 130 <= y <= 700:
+                return elem
+        except Exception:
+            continue
+    return None
 
 
 def get_elem_rect(sid: str, elem: str) -> dict[str, int]:
@@ -450,74 +510,84 @@ def check_repair_dialog(sid: str) -> None:
 # ----- Top-level driver ---------------------------------------------------
 
 
+def _open_chat_in_session(sid: str, target: str, *, verbose: bool) -> None:
+    """Try once, within the given session, to navigate to chat list + open
+    chat. Raises WeChatError on failure (predicate / chat not found etc).
+    """
+    time.sleep(2.0)  # let app activation settle
+    check_repair_dialog(sid)
+    ensure_chat_list(sid)
+    open_chat(sid, target)
+
+
 def send_message(target: str, message: str, *, terminate_after: bool = False,
                  verbose: bool = False) -> None:
     if not wda_ready():
         raise WeChatError(1, "WDA at http://localhost:8100 is not ready — run ~/code1/mobile_mcp/wda-up.sh first")
 
-    sid = new_session(WECHAT_BUNDLE)
-    if verbose:
-        print(f"[wechat-send] session={sid}", file=sys.stderr)
-    try:
-        time.sleep(6.0)  # initial WeChat load (chat list, network refresh)
-        check_repair_dialog(sid)
-        ensure_chat_list(sid)
+    # WeChat enters a recurring ~120 s window where the chat-list cells drop
+    # out of the accessibility tree (only ~4 StaticTexts left in the tree, all
+    # nav chrome). Within a session, that state is sticky — long-waits inside
+    # the same session don't clear it. The reliable workaround is to END the
+    # session and create a FRESH one (the new session activation re-syncs the
+    # accessibility tree). So our outer loop is "try in a session; on chat-not-
+    # found, kill the session and retry with a new one", up to a deadline.
+    deadline = time.time() + 300  # 5 min absolute cap
+    attempt = 0
+    last_err: WeChatError | None = None
 
+    while time.time() < deadline:
+        attempt += 1
+        sid = new_session(WECHAT_BUNDLE)
         if verbose:
-            print(f"[wechat-send] opening chat '{target}'", file=sys.stderr)
-        # Chat row may not be rendered yet on first try; retry up to 5× over
-        # ~20s. Between attempts re-assert we're on the chat list, because
-        # WeChat occasionally backgrounds itself to a non-chat tab (we see a
-        # consistent ~120s cycle of this on the test device).
-        last_err: WeChatError | None = None
-        for attempt in range(5):
-            try:
-                open_chat(sid, target)
-                break
-            except WeChatError as e:
-                last_err = e
-                if verbose:
-                    print(f"[wechat-send] open_chat attempt {attempt+1} failed: {e}",
-                          file=sys.stderr)
-                # Re-navigate to chat list before the next try. Also re-check
-                # for 异常修复 dialog that may have popped up between attempts.
+            print(f"[wechat-send] session={sid} (attempt {attempt})", file=sys.stderr)
+
+        try:
+            _open_chat_in_session(sid, target, verbose=verbose)
+        except WeChatError as e:
+            last_err = e
+            if e.code != 3:
+                # auth / repair / unexpected — re-raise, no point retrying
+                end_session(sid)
+                raise
+            if verbose:
+                print(f"[wechat-send] chat-find failed in session {sid[:8]}: {e}; "
+                      f"ending session and retrying", file=sys.stderr)
+            end_session(sid)
+            time.sleep(5.0)  # brief pause before recreating session
+            continue
+
+        # open_chat succeeded — finish the send in this same session.
+        try:
+            if verbose:
+                print(f"[wechat-send] focusing input", file=sys.stderr)
+            focus_input(sid)
+            clear_draft(sid)
+
+            if verbose:
+                print(f"[wechat-send] typing {len(message)} chars", file=sys.stderr)
+            type_message(sid, message)
+            tap_send(sid)
+
+            if not verify_sent(sid, message):
+                raise WeChatError(4, "tap-send fired but input field still has text — "
+                                     "send didn't go through (button missed? send disabled?)")
+            if verbose:
+                print(f"[wechat-send] verified sent (input is empty)", file=sys.stderr)
+
+            if not terminate_after:
                 try:
-                    check_repair_dialog(sid)
-                except WeChatError:
-                    raise
-                ensure_chat_list(sid)
-                time.sleep(3.0)
-        else:
-            raise last_err or WeChatError(3, f"chat '{target}' never appeared")
+                    back_to_chat_list(sid)
+                except Exception:
+                    pass
+            return  # success
+        finally:
+            if terminate_after:
+                terminate(sid, WECHAT_BUNDLE)
+            end_session(sid)
 
-        if verbose:
-            print(f"[wechat-send] focusing input", file=sys.stderr)
-        focus_input(sid)
-        clear_draft(sid)
-
-        if verbose:
-            print(f"[wechat-send] typing {len(message)} chars", file=sys.stderr)
-        type_message(sid, message)
-        tap_send(sid)
-
-        if not verify_sent(sid, message):
-            raise WeChatError(4, "tap-send fired but input field still has text — "
-                                 "send didn't go through (button missed? send disabled?)")
-        if verbose:
-            print(f"[wechat-send] verified sent (input is empty)", file=sys.stderr)
-
-        # By default leave WeChat on chat list (not chat detail, not killed).
-        # WeChat's self-protection 异常修复 mode triggers after ~3 rapid
-        # kill/launch cycles — backing out is cheaper AND avoids that trap.
-        if not terminate_after:
-            try:
-                back_to_chat_list(sid)
-            except Exception:
-                pass
-    finally:
-        if terminate_after:
-            terminate(sid, WECHAT_BUNDLE)
-        end_session(sid)
+    raise last_err or WeChatError(3, f"chat '{target}' never appeared "
+                                      f"within 5-minute budget across {attempt} sessions")
 
 
 def main() -> int:
