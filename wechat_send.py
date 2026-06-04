@@ -269,19 +269,57 @@ def open_chat(sid: str, target: str) -> None:
                          f"(row was at y={rect.get('y')})")
 
 
-def clear_draft(sid: str) -> None:
-    """Long-press iOS keyboard's delete key to wipe any leftover draft text.
-
-    Must be called after the input is focused (keyboard up).
+def find_input_field(sid: str) -> str | None:
+    """Locate WeChat's message input. It's the only XCUIElementTypeTextView
+    in the chat detail page (Other text inputs are search boxes elsewhere).
     """
-    long_press_xy(sid, KEYBOARD_DELETE_X, KEYBOARD_DELETE_Y, CLEAR_DRAFT_MS)
-    time.sleep(0.5)
+    elem = find(sid, 'type == "XCUIElementTypeTextView"')
+    return elem
 
 
 def focus_input(sid: str) -> None:
-    """Tap WeChat's message input bar to raise the keyboard."""
+    """Tap WeChat's message input bar to raise the keyboard. Tries to click
+    the located TextView first (most reliable), falls back to coordinate tap.
+    """
+    elem = find_input_field(sid)
+    if elem:
+        try:
+            click_elem(sid, elem)
+            time.sleep(1.5)
+            return
+        except Exception:
+            pass
     tap_xy(sid, 130, INPUT_BAR_Y_DEFAULT)
     time.sleep(1.5)
+
+
+def clear_draft(sid: str) -> None:
+    """Wipe any leftover draft text in the chat input.
+
+    The naive "long-press delete key" approach only removes ~10 chars/s, so a
+    5-second long-press only handles ~50 char drafts. WeChat drafts can be
+    hundreds of chars (e.g. a forwarded log message). Use WDA's element /clear
+    endpoint instead — atomic, regardless of length.
+
+    Must be called after the input is focused (keyboard up).
+    """
+    elem = find_input_field(sid)
+    if elem:
+        try:
+            post(f"/session/{sid}/element/{elem}/clear", timeout=10)
+            time.sleep(0.3)
+            return
+        except Exception:
+            pass
+
+    # Fallback: long-press iOS keyboard's delete key. Time it proportional to
+    # whatever text exists in the input (read length first).
+    n = 0
+    if elem:
+        n = len(get_text(sid, elem))
+    duration_ms = max(2000, min(30000, (n + 20) * 150))  # ~7 chars/s, 30s cap
+    long_press_xy(sid, KEYBOARD_DELETE_X, KEYBOARD_DELETE_Y, duration_ms)
+    time.sleep(0.5)
 
 
 def type_message(sid: str, message: str) -> None:
@@ -296,14 +334,38 @@ def type_message(sid: str, message: str) -> None:
 
 
 def tap_send(sid: str) -> None:
-    """Tap the keyboard's Send button. Only enabled once text is in input."""
-    # Prefer predicate lookup so we adapt to layout shifts; fall back to xy.
+    """Tap the keyboard's Send button. Only enabled once text is in input.
+
+    NOTE: WDA element/click on this button is unreliable (similar to chat-row
+    StaticText click). We always resolve to the button rect's center and tap
+    by coordinate, which actually fires the send action.
+    """
     btn = find(sid, 'type == "XCUIElementTypeButton" AND (name == "Send" OR name == "send" OR label == "发送")')
     if btn:
-        click_elem(sid, btn)
+        rect = get_elem_rect(sid, btn)
+        x = rect.get("x", SEND_BUTTON_X) + rect.get("width", 60) // 2
+        y = rect.get("y", SEND_BUTTON_Y) + rect.get("height", 30) // 2
+        tap_xy(sid, x, y)
     else:
         tap_xy(sid, SEND_BUTTON_X, SEND_BUTTON_Y)
     time.sleep(2.0)
+
+
+def verify_sent(sid: str, sent_message: str) -> bool:
+    """Confirm the send actually happened.
+
+    Heuristic: after a successful send, WeChat clears the input field. If the
+    input still contains our message text (or any prefix of it), send didn't
+    fire. We tolerate empty (sent) but reject any text that overlaps the
+    message we sent.
+    """
+    elem = find_input_field(sid)
+    if not elem:
+        # Can't find input — assume we're no longer in chat detail (something
+        # weird), don't claim success.
+        return False
+    cur = get_text(sid, elem)
+    return cur.strip() == ""
 
 
 def check_repair_dialog(sid: str) -> None:
@@ -357,11 +419,11 @@ def send_message(target: str, message: str, *, terminate_after: bool = False,
         type_message(sid, message)
         tap_send(sid)
 
-        # Best-effort verification: take a screenshot? Skip — WDA round-trip is
-        # slow. The send tap returns synchronously and the send button greys
-        # back out within ~1s if successful. We've slept 2s already.
+        if not verify_sent(sid, message):
+            raise WeChatError(4, "tap-send fired but input field still has text — "
+                                 "send didn't go through (button missed? send disabled?)")
         if verbose:
-            print(f"[wechat-send] done", file=sys.stderr)
+            print(f"[wechat-send] verified sent (input is empty)", file=sys.stderr)
 
         # By default leave WeChat on chat list (not chat detail, not killed).
         # WeChat's self-protection 异常修复 mode triggers after ~3 rapid
