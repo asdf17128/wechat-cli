@@ -72,6 +72,29 @@ chat list avoids that trap entirely.
 | 4 | send failed (button untappable, draft persists, network) |
 | 5 | bad CLI args |
 
+## Reliability + recommended retry pattern
+
+Empirically on the test device, the CLI hits a transient "chat not found"
+(exit 3) on ~20–30% of invocations spaced 10–60 seconds apart. The cause is
+a periodic WeChat/iOS state (~120 s window) during which WDA's predicate
+queries return 0 matches even though the chat list IS visually on-screen.
+We've tried longer waits, element re-queries, and forced chat-tab taps;
+none fully fix it.
+
+For routine usage spaced minutes-to-hours apart, the rate is much lower
+(<5%). The recommended pattern for callers is **one outer retry on exit 3**,
+with a sleep of at least 2 minutes between attempts (long enough to wait out
+the bad window):
+
+```bash
+~/code1/wechat-cli/wechat_send.py --to "$T" --msg "$M" \
+  || (sleep 150 && ~/code1/wechat-cli/wechat_send.py --to "$T" --msg "$M") \
+  || echo "wechat-send failed twice — investigate" >&2
+```
+
+The CLI auto-dismisses WeChat's `连续异常修复` dialog (exit 2 was previously
+fired here) so back-to-back invocations no longer surface that as a failure.
+
 ## Limits + known issues
 
 - **ASCII only is safest.** WDA's `keys` endpoint goes through iOS IME, which

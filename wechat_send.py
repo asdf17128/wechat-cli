@@ -189,14 +189,58 @@ class WeChatError(Exception):
         self.code = code
 
 
-def ensure_chat_list(sid: str) -> None:
-    """Tap WeChat's bottom-nav `微信` tab so we're on the chat list, not the
-    'Contacts/Discover/Me' tab (a previous session may have left us elsewhere).
+def on_chat_list(sid: str) -> bool:
+    """True iff we're on the chat list (the 微信 tab) right now.
+
+    Signal: the chat list view always has a SearchField at the top with name
+    "搜索". The other bottom-nav tabs don't have it (or have a differently
+    named one). This is more reliable than position-based checks.
     """
-    # The 微信 tab is the leftmost bottom-nav button. There's no easily-found
-    # accessibility label, but we can tap its icon area at approx (35, 800).
-    tap_xy(sid, 35, 800)
-    time.sleep(1.0)
+    return bool(find(sid, 'type == "XCUIElementTypeSearchField" AND name == "搜索"'))
+
+
+def ensure_chat_list(sid: str) -> None:
+    """Navigate to WeChat's chat list (微信 tab). Idempotent — if already
+    there, no-op. Handles common pre-conditions: in-chat detail, on a
+    different bottom-nav tab, or in a settings sub-page.
+    """
+    # Fast path: already on chat list.
+    if on_chat_list(sid):
+        return
+
+    # Try a back button first — handles being inside a chat detail or a
+    # nested settings page. Repeat a couple of times to climb out of nesting.
+    for _ in range(3):
+        back = find(sid, 'type == "XCUIElementTypeButton" AND (name == "返回" OR label == "返回")')
+        if back:
+            click_elem(sid, back)
+            time.sleep(0.8)
+            if on_chat_list(sid):
+                return
+        else:
+            break
+
+    # Try clicking the 微信 tab button. It's a Button with name="微信" in the
+    # bottom tab bar (y > 750).
+    for _ in range(3):
+        tabs = find_all(sid, 'type == "XCUIElementTypeButton" AND name == "微信"')
+        for tab in tabs:
+            rect = get_elem_rect(sid, tab)
+            if rect.get("y", 0) > 700:  # bottom-nav button
+                tap_xy(sid, rect.get("x", 35) + rect.get("width", 28) // 2,
+                            rect.get("y", 762) + rect.get("height", 28) // 2)
+                time.sleep(1.0)
+                if on_chat_list(sid):
+                    return
+                break
+        else:
+            # No 微信 tab button found — fall back to coordinate tap at the
+            # leftmost bottom-nav position (iPhone 12 Pro layout).
+            tap_xy(sid, 35, 800)
+            time.sleep(1.0)
+            if on_chat_list(sid):
+                return
+        time.sleep(0.5)
 
 
 def find_chat_row(sid: str, target: str) -> str:
@@ -226,12 +270,20 @@ def get_elem_rect(sid: str, elem: str) -> dict[str, int]:
 
 
 def back_to_chat_list(sid: str) -> None:
-    """If we're inside a chat, tap the back arrow at top-left to return to list."""
-    back = find(sid, 'type == "XCUIElementTypeButton" AND (name == "返回" OR label == "返回")')
-    if back:
-        click_elem(sid, back)
-        time.sleep(1.0)
-    # Always tap the chat-list tab too, as a belt-and-suspenders fallback.
+    """If we're inside a chat, tap the back arrow at top-left to return to
+    chat list. Then ensure we're on the 微信 tab.
+    """
+    # WeChat's 返回 button responds to coordinate taps but NOT to
+    # element/click (same quirk as chat-row StaticText and the Send button).
+    # So resolve the element to its rect and tap by xy.
+    for _ in range(2):
+        back = find(sid, 'type == "XCUIElementTypeButton" AND (name == "返回" OR label == "返回")')
+        if not back:
+            break
+        rect = get_elem_rect(sid, back)
+        tap_xy(sid, rect.get("x", 16) + rect.get("width", 12) // 2,
+                    rect.get("y", 47) + rect.get("height", 44) // 2)
+        time.sleep(0.8)
     ensure_chat_list(sid)
 
 
@@ -369,11 +421,30 @@ def verify_sent(sid: str, sent_message: str) -> bool:
 
 
 def check_repair_dialog(sid: str) -> None:
-    """Detect WeChat's 异常修复 self-protection dialog and bail out."""
-    if find(sid, 'label CONTAINS "微信连续异常"'):
-        raise WeChatError(2, "WeChat is in 异常修复 mode — open WeChat manually and tap 下一步 once")
+    """Detect WeChat's 异常修复 self-protection dialog. If present, auto-dismiss
+    by tapping `下一步` (which walks the user through a no-op repair flow and
+    returns to the chat list). Only bail out if dismiss fails or we hit a
+    different blocker (login wall).
+    """
     if find(sid, 'label CONTAINS "重新登录" OR label CONTAINS "请重新登录"'):
         raise WeChatError(2, "WeChat is not signed in")
+
+    if find(sid, 'label CONTAINS "微信连续异常"'):
+        # Auto-recover: tap 下一步, then wait for chat list to come back.
+        # The flow typically takes 3-5 seconds and lands on the chat list.
+        for step_attempt in range(8):
+            btn = find(sid, '(name == "下一步" OR label == "下一步")')
+            if not btn:
+                break  # past the modal, into the chat list (or somewhere else)
+            rect = get_elem_rect(sid, btn)
+            tap_xy(sid, rect.get("x", 195) + rect.get("width", 184) // 2,
+                        rect.get("y", 670) + rect.get("height", 49) // 2)
+            time.sleep(2.0)
+        else:
+            raise WeChatError(2, "WeChat 异常修复 dialog detected but auto-dismiss "
+                                 "couldn't get past it after 8 attempts")
+        # After dismiss, give WeChat a beat to load chat list before proceeding.
+        time.sleep(2.5)
 
 
 # ----- Top-level driver ---------------------------------------------------
@@ -394,9 +465,12 @@ def send_message(target: str, message: str, *, terminate_after: bool = False,
 
         if verbose:
             print(f"[wechat-send] opening chat '{target}'", file=sys.stderr)
-        # Chat row may not be rendered yet on first try; retry up to 4× over 12s.
+        # Chat row may not be rendered yet on first try; retry up to 5× over
+        # ~20s. Between attempts re-assert we're on the chat list, because
+        # WeChat occasionally backgrounds itself to a non-chat tab (we see a
+        # consistent ~120s cycle of this on the test device).
         last_err: WeChatError | None = None
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 open_chat(sid, target)
                 break
@@ -405,6 +479,13 @@ def send_message(target: str, message: str, *, terminate_after: bool = False,
                 if verbose:
                     print(f"[wechat-send] open_chat attempt {attempt+1} failed: {e}",
                           file=sys.stderr)
+                # Re-navigate to chat list before the next try. Also re-check
+                # for 异常修复 dialog that may have popped up between attempts.
+                try:
+                    check_repair_dialog(sid)
+                except WeChatError:
+                    raise
+                ensure_chat_list(sid)
                 time.sleep(3.0)
         else:
             raise last_err or WeChatError(3, f"chat '{target}' never appeared")
