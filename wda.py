@@ -57,6 +57,53 @@ def wda_ready() -> bool:
         return False
 
 
+# ----- screen geometry helpers --------------------------------------------
+#
+# Hardcoded pixel coords ((354, 79) etc) are device-specific: iPhone 12 Pro is
+# 390×844, Pro Max is 430×932, iPad is 1024×1366+, all with different keyboard
+# layouts. To stay portable, the CLI fetches screen size at session start and
+# expresses fallback positions as PROPORTIONS of width/height.
+#
+# Primary navigation always uses find_by_predicate + rect-center taps — those
+# are device-agnostic. Proportional coords are FALLBACKS for when an element
+# can't be found.
+
+
+_screen_size_cache: dict[str, dict[str, int]] = {}
+
+
+def screen_size(sid: str | None = None) -> tuple[int, int]:
+    """Return (width, height) of the current device in WDA logical coords.
+
+    Cached per-session if sid is given. Falls back to iPhone 12 Pro defaults
+    if /wda/screen fails (rare).
+    """
+    key = sid or "_global"
+    if key in _screen_size_cache:
+        s = _screen_size_cache[key]
+        return s["width"], s["height"]
+    try:
+        r = get("/wda/screen", timeout=5)
+        ss = r.get("value", {}).get("screenSize", {})
+        w = int(ss.get("width", 390))
+        h = int(ss.get("height", 844))
+    except Exception:
+        w, h = 390, 844
+    _screen_size_cache[key] = {"width": w, "height": h}
+    return w, h
+
+
+def px(sid: str, frac_x: float, frac_y: float) -> tuple[int, int]:
+    """Convert a (fraction-of-width, fraction-of-height) pair to absolute
+    logical pixels for the current device.
+
+    Example: px(sid, 0.91, 0.094) on iPhone 12 Pro (390×844) → (354, 79).
+    On Pro Max (430×932) the same call → (391, 87).
+    """
+    w, h = screen_size(sid)
+    return int(round(w * frac_x)), int(round(h * frac_y))
+
+
 def new_session(bundle_id: str) -> str:
     body = {"capabilities": {"alwaysMatch": {"bundleId": bundle_id}}}
     r = post("/session", body, timeout=30)

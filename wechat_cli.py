@@ -30,15 +30,25 @@ import wda
 
 WECHAT_BUNDLE = "com.tencent.xin"
 
-# UI constants — verified on iPhone 12 Pro / iOS 26 / WeChat 8.0.5x
-PLUS_BUTTON_XY = (354, 79)        # top-right + in chat list
-ADD_FRIEND_MENU_XY = (332, 175)   # 添加朋友 row in + popup
-SEARCH_BAR_Y_ADD = 117            # add-friend page search field y-center
-INPUT_BAR_Y_DEFAULT = 770         # WeChat chat input before keyboard rises
-KEYBOARD_DELETE_X = 355
-KEYBOARD_DELETE_Y = 668
-SEND_BUTTON_X = 340
-SEND_BUTTON_Y = 740
+# UI fallback positions expressed as (frac_w, frac_h) of the current device.
+# These are derived from iPhone 12 Pro (390×844) but should give the
+# right ballpark on Pro Max (430×932) and iPhone SE (375×667) too.
+# iPad layout is fundamentally different and not supported by these fallbacks.
+#
+# Primary navigation paths use find_by_predicate + rect-center taps (in
+# wda.tap_rect_center) which are fully device-agnostic; these constants are
+# only reached when an element lookup fails.
+
+FRAC_PLUS_BUTTON     = (0.908, 0.094)   # top-right + on chat list
+FRAC_ADD_FRIEND_MENU = (0.851, 0.207)   # 添加朋友 row in + popup
+FRAC_ADD_SEARCH_BAR  = (0.500, 0.138)   # search-by-id field on add-friend page
+FRAC_INPUT_BAR       = (0.333, 0.912)   # chat input bar (before keyboard rises)
+FRAC_KEYBOARD_DEL    = (0.910, 0.792)   # iOS keyboard's delete glyph
+FRAC_SEND_BUTTON     = (0.872, 0.877)   # iOS keyboard's Send button when text
+FRAC_BOTTOM_NAV_WX   = (0.090, 0.948)   # 微信 tab in bottom-nav (leftmost)
+FRAC_BOTTOM_NAV_CT   = (0.374, 0.948)   # 通讯录 tab
+FRAC_BOTTOM_NAV_DC   = (0.590, 0.948)   # 发现 tab
+FRAC_BOTTOM_NAV_ME   = (0.838, 0.948)   # 我 tab
 
 
 class WeChatError(Exception):
@@ -115,7 +125,7 @@ def ensure_chat_list(sid: str) -> None:
                     return
                 break
         else:
-            wda.tap_xy(sid, 35, 800)
+            wda.tap_xy(sid, *wda.px(sid, *FRAC_BOTTOM_NAV_WX))
             time.sleep(1.0)
             if on_chat_list(sid):
                 return
@@ -180,7 +190,7 @@ def focus_input(sid: str) -> None:
             return
         except Exception:
             pass
-    wda.tap_xy(sid, 130, INPUT_BAR_Y_DEFAULT)
+    wda.tap_xy(sid, *wda.px(sid, *FRAC_INPUT_BAR))
     time.sleep(1.5)
 
 
@@ -192,7 +202,8 @@ def clear_draft(sid: str) -> None:
     # Fallback: long-press delete key.
     n = len(wda.get_attr(sid, elem, "text")) if elem else 0
     duration_ms = max(2000, min(30000, (n + 20) * 150))
-    wda.long_press_xy(sid, KEYBOARD_DELETE_X, KEYBOARD_DELETE_Y, duration_ms)
+    dx, dy = wda.px(sid, *FRAC_KEYBOARD_DEL)
+    wda.long_press_xy(sid, dx, dy, duration_ms)
     time.sleep(0.5)
 
 
@@ -207,7 +218,7 @@ def tap_send_button(sid: str) -> None:
     if btn:
         wda.tap_rect_center(sid, btn)
     else:
-        wda.tap_xy(sid, SEND_BUTTON_X, SEND_BUTTON_Y)
+        wda.tap_xy(sid, *wda.px(sid, *FRAC_SEND_BUTTON))
     time.sleep(2.0)
 
 
@@ -227,7 +238,7 @@ def open_chat_by_name(sid: str, target: str) -> None:
     row = find_chat_row(sid, target)
     r = wda.get_rect(sid, row)
     label_y = r.get("y", 200) + r.get("height", 25) // 2
-    wda.tap_xy(sid, 200, label_y)
+    wda.tap_xy(sid, wda.px(sid, 0.51, 0)[0], label_y)
     time.sleep(2.5)
 
     for _ in range(6):
@@ -317,7 +328,7 @@ def open_add_friend_page(sid: str) -> None:
     if plus:
         wda.tap_rect_center(sid, plus)
     else:
-        wda.tap_xy(sid, *PLUS_BUTTON_XY)
+        wda.tap_xy(sid, *wda.px(sid, *FRAC_PLUS_BUTTON))
     time.sleep(1.8)
 
     # Tap 添加朋友
@@ -325,7 +336,7 @@ def open_add_friend_page(sid: str) -> None:
     if add:
         wda.tap_rect_center(sid, add)
     else:
-        wda.tap_xy(sid, *ADD_FRIEND_MENU_XY)
+        wda.tap_xy(sid, *wda.px(sid, *FRAC_ADD_FRIEND_MENU))
     time.sleep(2.5)
 
     # Verify by header text or search-field placeholder
@@ -343,7 +354,7 @@ def search_friend(sid: str, wx_id: str) -> None:
     if sf:
         wda.tap_rect_center(sid, sf)
     else:
-        wda.tap_xy(sid, 195, SEARCH_BAR_Y_ADD)
+        wda.tap_xy(sid, *wda.px(sid, *FRAC_ADD_SEARCH_BAR))
     time.sleep(1.2)
 
     wda.type_keys(sid, wx_id)
@@ -463,7 +474,7 @@ def ensure_contacts_tab(sid: str) -> None:
             time.sleep(1.5)
             return
     # Fallback: coord tap at known position
-    wda.tap_xy(sid, 146, 800)
+    wda.tap_xy(sid, *wda.px(sid, *FRAC_BOTTOM_NAV_CT))
     time.sleep(1.5)
 
 
@@ -508,7 +519,7 @@ def open_contact_profile(sid: str, name: str) -> None:
     if not row:
         raise WeChatError(3, f"contact '{name}' not found in 通讯录")
     r = wda.get_rect(sid, row)
-    wda.tap_xy(sid, 200, r.get("y", 200) + r.get("height", 25) // 2)
+    wda.tap_xy(sid, wda.px(sid, 0.51, 0)[0], r.get("y", 200) + r.get("height", 25) // 2)
     time.sleep(2.5)
 
     # Verify by header text or a distinctive profile element
@@ -607,7 +618,7 @@ def ensure_discover_tab(sid: str) -> None:
             wda.tap_rect_center(sid, tab)
             time.sleep(1.5)
             return
-    wda.tap_xy(sid, 230, 800)
+    wda.tap_xy(sid, *wda.px(sid, *FRAC_BOTTOM_NAV_DC))
     time.sleep(1.5)
 
 
@@ -620,7 +631,7 @@ def open_moments(sid: str) -> None:
     r = wda.get_rect(sid, row)
     if not (100 < r.get("y", 0) < 400):
         raise WeChatError(3, f"朋友圈 element found but at unexpected y={r.get('y')}")
-    wda.tap_xy(sid, 200, r.get("y", 200) + r.get("height", 25) // 2)
+    wda.tap_xy(sid, wda.px(sid, 0.51, 0)[0], r.get("y", 200) + r.get("height", 25) // 2)
     time.sleep(3.0)
 
     # Verify by 拍照 button at top-right
@@ -735,10 +746,9 @@ def open_my_moments(sid: str) -> None:
     """
     open_moments(sid)
     # WeChat shows a cover image at top with a small avatar in the corner.
-    # Tapping the avatar opens 我的朋友圈. Avatar is typically in the
-    # right portion of the cover area (around x=300, y=210).
-    # Fallback: tap anywhere on the cover area at y=200.
-    wda.tap_xy(sid, 300, 210)
+    # Tapping the avatar opens 我的朋友圈. Avatar is in the right portion of
+    # the cover (around 77% from left, 25% from top on the test device).
+    wda.tap_xy(sid, *wda.px(sid, 0.77, 0.249))
     time.sleep(2.5)
 
     # Verify by 我的朋友圈 nav title or distinctive UI

@@ -156,6 +156,30 @@ in a loop will trigger:
 - `moments-post`: ≤ 10/day
 - `send`: no observed limit (we've done 100+/day fine)
 
+## Device compatibility
+
+The CLI fetches the device's logical screen size at session start (via WDA's
+`/wda/screen` endpoint) and expresses all fallback coordinates as
+**fractions of width/height** rather than absolute pixels. So the same code
+should work on:
+
+| Device | Logical size | Status |
+|---|---|---|
+| iPhone SE (1st-3rd gen) | 375×667 | likely OK (untested) |
+| iPhone 12/13 mini | 375×812 | likely OK (untested) |
+| **iPhone 12 Pro** | **390×844** | **reference device — all coords derived here** |
+| iPhone 14/15/16 | 393×852 | likely OK (untested) |
+| iPhone 14/15 Plus, Pro Max | 430×932 | likely OK (untested) |
+| iPad (any size, any orientation) | varies, e.g. 1024×1366 | **NOT SUPPORTED** — layout fundamentally differs (side-by-side chat list + detail, etc.); add-friend / moments / del-friend paths assume a single-column phone layout |
+
+Primary navigation always uses `find_by_predicate + tap_rect_center` — those
+are device-agnostic regardless of size. Only the fallback paths (when an
+element can't be found) use proportional coords.
+
+If you hit problems on a non-reference device, the most likely cause is the
+predicate matches missing an element. Open an issue with a screenshot
+and the failing command's `-v` output.
+
 ## Per-command notes
 
 - `send` — production-ready, stress-tested 35/35 (100%) including session-
