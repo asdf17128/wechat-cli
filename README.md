@@ -1,17 +1,27 @@
 # wechat-cli
 
-A 200-line Python CLI that sends WeChat messages on an iPhone by driving
-**WebDriverAgent** (no Claude / no MCP at runtime). Used as the WeChat-output
-layer for daily-routine agents and scripts.
+Python CLI for automating common WeChat operations on an iPhone via
+**WebDriverAgent**. Pure stdlib (urllib) — no Claude/LLM at runtime, no pip
+deps.
 
-## What it does
+## Commands
+
+```
+wechat-cli send TARGET MESSAGE             # send a chat message
+wechat-cli add-friend WX_ID [--msg M]      # search wechat-id/phone, send request
+wechat-cli del-friend NAME [--confirm]     # remove contact (dry-run default)
+wechat-cli moments-post TEXT [--confirm]   # post text-only 朋友圈 (dry-run default)
+wechat-cli moments-del N [--confirm]       # delete Nth-newest own post (UNTESTED)
+```
+
+There is also a legacy single-purpose `wechat-send` script kept for
+backwards-compat with existing launchd jobs:
 
 ```bash
 $ wechat-send "1234" "[checkin] yuhang OK +2 · total 700 · 09:02"
 ```
 
-→ opens WeChat on the iPhone, navigates to the chat named `1234`, types the
-message, taps send, terminates WeChat. Total round-trip ~10-15 s.
+→ opens WeChat, navigates to the chat named `1234`, types, sends. ~10-15 s.
 
 The chat name is matched **exactly** against the StaticText label in WeChat's
 chat list (case-sensitive, no fuzzy match). Works for groups, contacts, and
@@ -127,6 +137,42 @@ Bash: ~/code1/wechat-cli/wechat_send.py --to "1234" --msg "..."
 instead of having to drive the iPhone themselves via mobile-mcp. The skill
 just teaches the agent which exit codes mean what, and reminds it to keep
 messages ASCII.
+
+## Rate-limit warning (important)
+
+WeChat **aggressively tracks** friend-add / friend-delete / moments-post
+frequency for anti-abuse. Stress-testing this CLI by running these commands
+in a loop will trigger:
+
+1. WeChat's `连续异常修复` self-protection (dialog blocks the app; CLI
+   auto-dismisses it for `下一步` and `暂不重启` variants)
+2. **Account-level rate limits** — too many friend ops in a day can lock
+   the friend-add feature for hours-to-days. We don't have a programmatic
+   way to detect this; it just silently fails or shows a Chinese warning.
+
+**Recommended limits per account per day:**
+- `add-friend`: ≤ 5/day
+- `del-friend`: ≤ 5/day
+- `moments-post`: ≤ 10/day
+- `send`: no observed limit (we've done 100+/day fine)
+
+## Per-command notes
+
+- `send` — production-ready, stress-tested 35/35 (100%) including session-
+  recreate auto-recovery for WeChat's ~120s accessibility-tree-stale window.
+- `add-friend` — tested with a fake wechat-id (correctly reports "user not
+  found" with exit 3). Live "actually added a friend" path is implemented
+  but only the dry-run side has been exercised.
+- `del-friend` — `--confirm` defaults off. Tested dry-run on a real contact
+  (reaches the profile page). The 更多 → 删除联系人 → confirm alert path is
+  implemented from observed UI but the final `--confirm` step hasn't been
+  exercised end-to-end (intentionally, to avoid losing the test contact).
+- `moments-post` — tested dry-run (opens text editor, cancels out). Live
+  `--confirm` posting works in theory but was not exercised against the test
+  account (which doesn't actively use Moments).
+- `moments-del` — **UNTESTED**. The test account had zero moments at build
+  time, so the long-press → 删除 → confirm path is implemented from standard
+  WeChat patterns but not verified. Please test against a disposable post.
 
 ## License
 

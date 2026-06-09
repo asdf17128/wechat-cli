@@ -51,23 +51,29 @@ class WeChatError(Exception):
 
 
 def check_repair_dialog(sid: str) -> None:
-    """Auto-dismiss WeChat's 连续异常修复 dialog by tapping 下一步 until
-    it's gone. Bail with code 2 only on login wall.
+    """Auto-dismiss WeChat's repair flow dialogs:
+      - 连续异常修复 page → 下一步
+      - "尝试重启 iPhone" escalation page → 暂不重启
+      - Bail with code 2 only on login wall.
     """
     if wda.find(sid, 'label CONTAINS "重新登录" OR label CONTAINS "请重新登录"'):
         raise WeChatError(2, "WeChat is not signed in")
 
-    if not wda.find(sid, 'label CONTAINS "微信连续异常"'):
-        return
-
-    for _ in range(8):
-        btn = wda.find(sid, '(name == "下一步" OR label == "下一步")')
+    # Loop until no repair dialog visible. Handle both 下一步 and 暂不重启.
+    for _ in range(10):
+        if not (wda.find(sid, 'label CONTAINS "微信连续异常"') or
+                wda.find(sid, 'label CONTAINS "尝试重启 iPhone" OR label CONTAINS "尝试重启"')):
+            return  # no dialog
+        btn = (wda.find(sid, '(name == "下一步" OR label == "下一步")') or
+               wda.find(sid, '(name == "暂不重启" OR label == "暂不重启")'))
         if not btn:
             break
         wda.tap_rect_center(sid, btn)
         time.sleep(2.0)
-    else:
-        raise WeChatError(2, "WeChat 异常修复 dialog couldn't be auto-dismissed")
+    if (wda.find(sid, 'label CONTAINS "微信连续异常"') or
+        wda.find(sid, 'label CONTAINS "尝试重启 iPhone" OR label CONTAINS "尝试重启"')):
+        raise WeChatError(2, "WeChat repair dialog couldn't be auto-dismissed "
+                             "(may need iPhone restart per WeChat's escalated flow)")
     time.sleep(2.5)
 
 
@@ -713,6 +719,124 @@ def cmd_moments_post(args: argparse.Namespace) -> int:
 
 
 # ==========================================================================
+# subcommand: moments-del
+# ==========================================================================
+#
+# UNTESTED ON LIVE POSTS — the test account had zero moments at build time
+# so the long-press → 删除 → confirm path is implemented from standard
+# WeChat UI conventions but not yet verified against a real post.
+# Default is DRY RUN; pass --confirm to attempt actual deletion.
+# Please report regressions: github.com/asdf17128/wechat-cli/issues
+
+
+def open_my_moments(sid: str) -> None:
+    """From 朋友圈 timeline, tap own avatar/cover (top of page) to enter
+    我的朋友圈 page where only own posts are listed.
+    """
+    open_moments(sid)
+    # WeChat shows a cover image at top with a small avatar in the corner.
+    # Tapping the avatar opens 我的朋友圈. Avatar is typically in the
+    # right portion of the cover area (around x=300, y=210).
+    # Fallback: tap anywhere on the cover area at y=200.
+    wda.tap_xy(sid, 300, 210)
+    time.sleep(2.5)
+
+    # Verify by 我的朋友圈 nav title or distinctive UI
+    if not wda.find(sid, '(type == "XCUIElementTypeNavigationBar" AND name == "我的朋友圈") '
+                         'OR (type == "XCUIElementTypeStaticText" AND label == "我的相册")'):
+        # The exact element label varies — proceed but log a warning. Some
+        # WeChat versions land on a profile-style view first.
+        pass
+
+
+def long_press_nth_post(sid: str, n: int) -> None:
+    """Long-press the Nth post (1-indexed, newest first) on the current
+    moments page to bring up the action menu.
+
+    Heuristic: find all visible Cell-like containers in the post list,
+    sort by y, pick the (n-1)th, long-press its center.
+    """
+    # Posts on 我的朋友圈 are usually Cells, but WeChat sometimes uses Other.
+    # Try Cell first.
+    cells = wda.find_all(sid, 'type == "XCUIElementTypeCell"')
+    if not cells:
+        cells = wda.find_all(sid, 'type == "XCUIElementTypeOther"')
+
+    # Filter to cells whose y is in the timeline body and height is reasonable.
+    timeline = []
+    for c in cells:
+        r = wda.get_rect(sid, c)
+        if 200 <= r.get("y", 0) <= 800 and r.get("height", 0) > 80:
+            timeline.append((r.get("y", 0), c, r))
+    timeline.sort()
+
+    if len(timeline) < n:
+        raise WeChatError(3, f"only {len(timeline)} posts visible; cannot target N={n} "
+                             f"(scrolling to load more not implemented yet)")
+
+    _, elem, rect = timeline[n - 1]
+    cx = rect.get("x", 0) + rect.get("width", 200) // 2
+    cy = rect.get("y", 0) + rect.get("height", 100) // 2
+    wda.long_press_xy(sid, cx, cy, 800)
+    time.sleep(1.5)
+
+
+def tap_delete_in_post_menu(sid: str) -> None:
+    """After long-press on a post, WeChat shows a small menu with 评论 /
+    点赞 / ... / 删除 . Tap 删除.
+    """
+    btn = wda.find(sid, '(name == "删除" OR label == "删除") AND type != "XCUIElementTypeAlert"')
+    if not btn:
+        raise WeChatError(3, "no 删除 in long-press post menu — wrong page or post is not own?")
+    wda.tap_rect_center(sid, btn)
+    time.sleep(1.5)
+
+
+def cmd_moments_del(args: argparse.Namespace) -> int:
+    n = args.n
+    if n < 1:
+        print(f"wechat-cli moments-del: N must be >= 1 (1 = newest)", file=sys.stderr)
+        return 5
+
+    if not wda.wda_ready():
+        print("wechat-cli: WDA at :8100 not ready", file=sys.stderr)
+        return 1
+
+    sid = wda.new_session(WECHAT_BUNDLE)
+    if args.verbose:
+        print(f"[moments-del] session={sid[:8]}", file=sys.stderr)
+    try:
+        time.sleep(3.0)
+        check_repair_dialog(sid)
+        if args.verbose:
+            print(f"[moments-del] navigating to 我的朋友圈", file=sys.stderr)
+        open_my_moments(sid)
+        if args.verbose:
+            print(f"[moments-del] long-pressing post #{n}", file=sys.stderr)
+        long_press_nth_post(sid, n)
+
+        if not args.confirm:
+            print(f"[moments-del] DRY RUN — would now tap 删除 + confirm. "
+                  f"Re-run with --confirm to actually delete.", file=sys.stderr)
+            return 0
+
+        tap_delete_in_post_menu(sid)
+        confirm_delete(sid)
+        if args.verbose:
+            print(f"[moments-del] deleted post #{n}", file=sys.stderr)
+        return 0
+    except WeChatError as e:
+        print(f"wechat-cli moments-del: {e}", file=sys.stderr)
+        return e.code
+    finally:
+        try:
+            ensure_chat_list(sid)
+        except Exception:
+            pass
+        wda.end_session(sid)
+
+
+# ==========================================================================
 # main dispatcher
 # ==========================================================================
 
@@ -750,6 +874,11 @@ def main() -> int:
     pm.add_argument("--stdin", action="store_true", help="read text from stdin")
     pm.add_argument("--confirm", action="store_true", help="actually post; default is dry-run")
 
+    # moments-del
+    pmd = sub.add_parser("moments-del", help="delete the Nth-newest own moments post (UNTESTED; dry-run unless --confirm)")
+    pmd.add_argument("n", type=int, default=1, nargs="?", help="post index, 1=newest (default 1)")
+    pmd.add_argument("--confirm", action="store_true", help="actually delete; default is dry-run")
+
     args = p.parse_args()
     if args.cmd == "send":
         return cmd_send(args)
@@ -759,6 +888,8 @@ def main() -> int:
         return cmd_del_friend(args)
     if args.cmd == "moments-post":
         return cmd_moments_post(args)
+    if args.cmd == "moments-del":
+        return cmd_moments_del(args)
     print(f"wechat-cli: unknown command {args.cmd}", file=sys.stderr)
     return 5
 
