@@ -61,29 +61,67 @@ class WeChatError(Exception):
 
 
 def check_repair_dialog(sid: str) -> None:
-    """Auto-dismiss WeChat's repair flow dialogs:
-      - 连续异常修复 page → 下一步
-      - "尝试重启 iPhone" escalation page → 暂不重启
-      - Bail with code 2 only on login wall.
+    """Auto-dismiss WeChat's repair flow dialogs. The flow escalates over
+    repeated rapid restarts:
+
+      Level 1: 连续异常修复 → tap 下一步
+      Level 2: 尝试重启 iPhone → tap 暂不重启
+      Level 3: 尝试清理缓存 → tap 取消 (NOT 清理缓存! that forces re-login)
+      Level 4: 上传日志文件 → tap back-arrow at top-left
+               (page blocks accessibility queries, so no predicate match works)
+
+    Bail with code 2 only on login wall.
     """
     if wda.find(sid, 'label CONTAINS "重新登录" OR label CONTAINS "请重新登录"'):
         raise WeChatError(2, "WeChat is not signed in")
 
-    # Loop until no repair dialog visible. Handle both 下一步 and 暂不重启.
-    for _ in range(10):
-        if not (wda.find(sid, 'label CONTAINS "微信连续异常"') or
-                wda.find(sid, 'label CONTAINS "尝试重启 iPhone" OR label CONTAINS "尝试重启"')):
-            return  # no dialog
-        btn = (wda.find(sid, '(name == "下一步" OR label == "下一步")') or
-               wda.find(sid, '(name == "暂不重启" OR label == "暂不重启")'))
+    def in_repair_flow() -> bool:
+        # Try source-xml fallback for Level 4 (predicates don't reach the
+        # WebView-style upload-log page).
+        try:
+            src = wda.get(f"/session/{sid}/source?format=xml", timeout=5)
+            xml = src.get("value", "") if isinstance(src.get("value"), str) else ""
+        except Exception:
+            xml = ""
+        return bool(
+            wda.find(sid, 'label CONTAINS "微信连续异常"') or
+            wda.find(sid, 'label CONTAINS "尝试重启 iPhone" OR label CONTAINS "尝试重启"') or
+            wda.find(sid, 'label CONTAINS "尝试清理缓存"') or
+            "上传日志文件" in xml or
+            "上传日志" in xml
+        )
+
+    for _ in range(12):
+        if not in_repair_flow():
+            return
+        # Pick the SAFE dismiss button for each level. Source-xml gates first
+        # so Level 4 wins (its 取消 isn't accessibility-queryable).
+        try:
+            src = wda.get(f"/session/{sid}/source?format=xml", timeout=5)
+            xml = src.get("value", "") if isinstance(src.get("value"), str) else ""
+        except Exception:
+            xml = ""
+
+        if "上传日志" in xml:
+            # Back-arrow at standard nav-bar position (works on iPhone 12 Pro
+            # 390×844; on Pro Max 430×932 still hits the chevron's tap target).
+            wda.tap_xy(sid, *wda.px(sid, 0.08, 0.06))
+            time.sleep(2.0)
+            continue
+
+        if wda.find(sid, 'label CONTAINS "尝试清理缓存"'):
+            btn = wda.find(sid, '(name == "取消" OR label == "取消")')
+        elif wda.find(sid, 'label CONTAINS "尝试重启" OR label CONTAINS "尝试重启 iPhone"'):
+            btn = wda.find(sid, '(name == "暂不重启" OR label == "暂不重启")')
+        else:
+            btn = wda.find(sid, '(name == "下一步" OR label == "下一步")')
         if not btn:
             break
         wda.tap_rect_center(sid, btn)
         time.sleep(2.0)
-    if (wda.find(sid, 'label CONTAINS "微信连续异常"') or
-        wda.find(sid, 'label CONTAINS "尝试重启 iPhone" OR label CONTAINS "尝试重启"')):
+    if in_repair_flow():
         raise WeChatError(2, "WeChat repair dialog couldn't be auto-dismissed "
-                             "(may need iPhone restart per WeChat's escalated flow)")
+                             "(escalated flow — try opening WeChat manually first)")
     time.sleep(2.5)
 
 
@@ -740,66 +778,62 @@ def cmd_moments_post(args: argparse.Namespace) -> int:
 # Please report regressions: github.com/asdf17128/wechat-cli/issues
 
 
-def open_my_moments(sid: str) -> None:
-    """From 朋友圈 timeline, tap own avatar/cover (top of page) to enter
-    我的朋友圈 page where only own posts are listed.
+def find_post_delete_buttons(sid: str) -> list[tuple[int, str, dict[str, int]]]:
+    """Find all in-timeline trash buttons on the 朋友圈 page.
+
+    WeChat shows a small trash-bin icon next to each of your own posts'
+    timestamp/comment row. The accessibility identifier is
+    `Moments_DeleteButton` with label `trash on filled` (~16×17 px).
+    Tapping it raises iOS's confirm alert with a destructive 删除 button.
+
+    Returns: list of (y, element_id, rect) sorted top-to-bottom — index 0 is
+    the newest visible post.
     """
-    open_moments(sid)
-    # WeChat shows a cover image at top with a small avatar in the corner.
-    # Tapping the avatar opens 我的朋友圈. Avatar is in the right portion of
-    # the cover (around 77% from left, 25% from top on the test device).
-    wda.tap_xy(sid, *wda.px(sid, 0.77, 0.249))
-    time.sleep(2.5)
-
-    # Verify by 我的朋友圈 nav title or distinctive UI
-    if not wda.find(sid, '(type == "XCUIElementTypeNavigationBar" AND name == "我的朋友圈") '
-                         'OR (type == "XCUIElementTypeStaticText" AND label == "我的相册")'):
-        # The exact element label varies — proceed but log a warning. Some
-        # WeChat versions land on a profile-style view first.
-        pass
-
-
-def long_press_nth_post(sid: str, n: int) -> None:
-    """Long-press the Nth post (1-indexed, newest first) on the current
-    moments page to bring up the action menu.
-
-    Heuristic: find all visible Cell-like containers in the post list,
-    sort by y, pick the (n-1)th, long-press its center.
-    """
-    # Posts on 我的朋友圈 are usually Cells, but WeChat sometimes uses Other.
-    # Try Cell first.
-    cells = wda.find_all(sid, 'type == "XCUIElementTypeCell"')
-    if not cells:
-        cells = wda.find_all(sid, 'type == "XCUIElementTypeOther"')
-
-    # Filter to cells whose y is in the timeline body and height is reasonable.
+    candidates = wda.find_all(
+        sid,
+        '(name == "Moments_DeleteButton" OR label == "trash on filled")'
+    )
     timeline = []
-    for c in cells:
-        r = wda.get_rect(sid, c)
-        if 200 <= r.get("y", 0) <= 800 and r.get("height", 0) > 80:
-            timeline.append((r.get("y", 0), c, r))
+    for elem in candidates:
+        r = wda.get_rect(sid, elem)
+        y = r.get("y", 0)
+        # Sanity-filter to the scrollable timeline body so we don't trip on
+        # something unexpected the SDK adds outside it.
+        if 100 <= y <= 800:
+            timeline.append((y, elem, r))
     timeline.sort()
-
-    if len(timeline) < n:
-        raise WeChatError(3, f"only {len(timeline)} posts visible; cannot target N={n} "
-                             f"(scrolling to load more not implemented yet)")
-
-    _, elem, rect = timeline[n - 1]
-    cx = rect.get("x", 0) + rect.get("width", 200) // 2
-    cy = rect.get("y", 0) + rect.get("height", 100) // 2
-    wda.long_press_xy(sid, cx, cy, 800)
-    time.sleep(1.5)
+    return timeline
 
 
-def tap_delete_in_post_menu(sid: str) -> None:
-    """After long-press on a post, WeChat shows a small menu with 评论 /
-    点赞 / ... / 删除 . Tap 删除.
+def confirm_delete_alert(sid: str) -> None:
+    """Tap the destructive 删除 on the confirm dialog that pops up after
+    the trash icon. WeChat uses an in-app dialog (not iOS UIAlert) — both
+    取消 / 删除 are XCUIElementTypeStaticText inside a tappable cell, both
+    label and name equal "删除" / "取消", and they sit on the SAME y row.
+
+    Disambiguate from the in-timeline trash button (~16×17 px) by requiring
+    StaticText (the trash is a Button) — and disambiguate from any chat-
+    list 删除 actions by gating on the visible question text "删除该朋友圈？".
     """
-    btn = wda.find(sid, '(name == "删除" OR label == "删除") AND type != "XCUIElementTypeAlert"')
-    if not btn:
-        raise WeChatError(3, "no 删除 in long-press post menu — wrong page or post is not own?")
-    wda.tap_rect_center(sid, btn)
-    time.sleep(1.5)
+    # If WeChat's repair flow stole the foreground in the interim, dismiss
+    # it and bail — the dialog was lost. Caller can retry.
+    check_repair_dialog(sid)
+
+    for _ in range(8):
+        # The dialog renders the question above the two-button row.
+        if not wda.find(sid, 'label CONTAINS "删除该朋友圈"'):
+            time.sleep(0.5)
+            continue
+        btn = wda.find(
+            sid,
+            'type == "XCUIElementTypeStaticText" AND (name == "删除" OR label == "删除")'
+        )
+        if btn:
+            wda.tap_rect_center(sid, btn)
+            time.sleep(2.0)
+            return
+        time.sleep(0.5)
+    raise WeChatError(3, "no 删除该朋友圈 confirmation dialog after tapping trash icon")
 
 
 def cmd_moments_del(args: argparse.Namespace) -> int:
@@ -819,19 +853,36 @@ def cmd_moments_del(args: argparse.Namespace) -> int:
         time.sleep(3.0)
         check_repair_dialog(sid)
         if args.verbose:
-            print(f"[moments-del] navigating to 我的朋友圈", file=sys.stderr)
-        open_my_moments(sid)
+            print(f"[moments-del] opening 朋友圈 timeline", file=sys.stderr)
+        open_moments(sid)
+        time.sleep(2.0)  # let timeline finish loading
+
+        # Find own-post trash buttons in the timeline. WeChat shows a small
+        # trash-bin icon next to each of your own posts' timestamps.
+        buttons = find_post_delete_buttons(sid)
         if args.verbose:
-            print(f"[moments-del] long-pressing post #{n}", file=sys.stderr)
-        long_press_nth_post(sid, n)
+            print(f"[moments-del] found {len(buttons)} own-post delete buttons",
+                  file=sys.stderr)
+        if len(buttons) < n:
+            raise WeChatError(3, f"only {len(buttons)} own posts visible; cannot "
+                                 f"target N={n} (scroll-to-load more is not implemented)")
+
+        _, elem, rect = buttons[n - 1]
+        if args.verbose:
+            print(f"[moments-del] tapping trash for post #{n} at y={rect.get('y')}",
+                  file=sys.stderr)
 
         if not args.confirm:
-            print(f"[moments-del] DRY RUN — would now tap 删除 + confirm. "
+            print(f"[moments-del] DRY RUN — would now tap the trash icon at "
+                  f"({rect.get('x')},{rect.get('y')}) and confirm 删除. "
                   f"Re-run with --confirm to actually delete.", file=sys.stderr)
             return 0
 
-        tap_delete_in_post_menu(sid)
-        confirm_delete(sid)
+        wda.tap_rect_center(sid, elem)
+        time.sleep(1.5)
+        if args.verbose:
+            print(f"[moments-del] confirming 删除 alert", file=sys.stderr)
+        confirm_delete_alert(sid)
         if args.verbose:
             print(f"[moments-del] deleted post #{n}", file=sys.stderr)
         return 0
