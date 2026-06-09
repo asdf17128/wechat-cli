@@ -442,6 +442,277 @@ def cmd_add_friend(args: argparse.Namespace) -> int:
 
 
 # ==========================================================================
+# subcommand: del-friend
+# ==========================================================================
+
+
+def ensure_contacts_tab(sid: str) -> None:
+    """Switch to 通讯录 tab (bottom nav, position 2)."""
+    # First find the 通讯录 Button in bottom nav
+    tabs = wda.find_all(sid, 'type == "XCUIElementTypeButton" AND name == "通讯录"')
+    for tab in tabs:
+        r = wda.get_rect(sid, tab)
+        if r.get("y", 0) > 700:
+            wda.tap_rect_center(sid, tab)
+            time.sleep(1.5)
+            return
+    # Fallback: coord tap at known position
+    wda.tap_xy(sid, 146, 800)
+    time.sleep(1.5)
+
+
+def find_contact_in_list(sid: str, name: str) -> str | None:
+    """Find a contact row by exact label match in the 通讯录 tab.
+
+    Strategy: try the direct list first (most names are visible without
+    scrolling for accounts with <30 contacts). If not found, use the search
+    field at top to filter, then look again.
+    """
+    # First pass: look directly in the visible list.
+    matches = wda.find_all(
+        sid, f'type == "XCUIElementTypeStaticText" AND (label == "{name}" OR name == "{name}")'
+    )
+    for elem in matches:
+        r = wda.get_rect(sid, elem)
+        if 130 <= r.get("y", 0) <= 700:
+            return elem
+
+    # Not in visible list — try the search bar at top of 通讯录 page.
+    sf = wda.find(sid, 'type == "XCUIElementTypeSearchField"')
+    if sf:
+        wda.tap_rect_center(sid, sf)
+        time.sleep(1.0)
+        wda.type_keys(sid, name)
+        time.sleep(1.5)
+
+        matches = wda.find_all(
+            sid, f'type == "XCUIElementTypeStaticText" AND (label == "{name}" OR name == "{name}")'
+        )
+        for elem in matches:
+            r = wda.get_rect(sid, elem)
+            if 130 <= r.get("y", 0) <= 700:
+                return elem
+    return None
+
+
+def open_contact_profile(sid: str, name: str) -> None:
+    """Search and tap into the contact's profile page."""
+    ensure_contacts_tab(sid)
+    row = find_contact_in_list(sid, name)
+    if not row:
+        raise WeChatError(3, f"contact '{name}' not found in 通讯录")
+    r = wda.get_rect(sid, row)
+    wda.tap_xy(sid, 200, r.get("y", 200) + r.get("height", 25) // 2)
+    time.sleep(2.5)
+
+    # Verify by header text or a distinctive profile element
+    if not wda.find(sid, f'type == "XCUIElementTypeStaticText" AND label == "{name}"'):
+        raise WeChatError(3, f"opened a profile but it's not '{name}'")
+
+
+def tap_delete_friend(sid: str) -> None:
+    """On a contact's profile: 更多 (top-right) → 删除联系人 in popover."""
+    more = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "更多" OR label == "更多")')
+    if not more:
+        raise WeChatError(3, "no '更多' button on profile page")
+    wda.tap_rect_center(sid, more)
+    time.sleep(1.8)
+
+    del_btn = wda.find(sid, '(name == "删除联系人" OR label == "删除联系人")')
+    if not del_btn:
+        raise WeChatError(3, "no '删除联系人' in profile menu — wrong page or contact?")
+    wda.tap_rect_center(sid, del_btn)
+    time.sleep(1.8)
+
+
+def confirm_delete(sid: str) -> None:
+    """On the confirmation alert, tap the destructive 删除 button.
+    iOS alerts surface as XCUIElementTypeAlert / XCUIElementTypeButton.
+    """
+    # Try alert first
+    btn = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "删除" OR label == "删除")')
+    if not btn:
+        raise WeChatError(3, "no 删除 confirm button — confirmation dialog not visible")
+    wda.tap_rect_center(sid, btn)
+    time.sleep(2.0)
+
+
+def cmd_del_friend(args: argparse.Namespace) -> int:
+    name = args.name
+    if not name:
+        print("wechat-cli del-friend: need NAME", file=sys.stderr)
+        return 5
+
+    if not wda.wda_ready():
+        print("wechat-cli: WDA at :8100 not ready — run wda-up.sh", file=sys.stderr)
+        return 1
+
+    sid = wda.new_session(WECHAT_BUNDLE)
+    if args.verbose:
+        print(f"[del-friend] session={sid[:8]}", file=sys.stderr)
+    try:
+        time.sleep(3.0)
+        check_repair_dialog(sid)
+        open_contact_profile(sid, name)
+        if args.verbose:
+            print(f"[del-friend] on profile for '{name}'", file=sys.stderr)
+
+        if not args.confirm:
+            print(f"[del-friend] DRY RUN — would now tap 更多 → 删除联系人 → confirm. "
+                  f"Re-run with --confirm to actually delete.", file=sys.stderr)
+            return 0
+
+        tap_delete_friend(sid)
+        if args.verbose:
+            print(f"[del-friend] tapping confirmation 删除", file=sys.stderr)
+        confirm_delete(sid)
+        if args.verbose:
+            print(f"[del-friend] deleted '{name}'", file=sys.stderr)
+        return 0
+    except WeChatError as e:
+        print(f"wechat-cli del-friend: {e}", file=sys.stderr)
+        return e.code
+    finally:
+        # Back to chat list to leave WeChat in known state
+        try:
+            for _ in range(4):
+                back = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "返回" OR label == "返回")')
+                if not back:
+                    break
+                wda.tap_rect_center(sid, back)
+                time.sleep(0.8)
+            ensure_chat_list(sid)
+        except Exception:
+            pass
+        wda.end_session(sid)
+
+
+# ==========================================================================
+# subcommand: moments-post
+# ==========================================================================
+
+
+def ensure_discover_tab(sid: str) -> None:
+    """Tap 发现 bottom-nav tab."""
+    tabs = wda.find_all(sid, 'type == "XCUIElementTypeButton" AND name == "发现"')
+    for tab in tabs:
+        r = wda.get_rect(sid, tab)
+        if r.get("y", 0) > 700:
+            wda.tap_rect_center(sid, tab)
+            time.sleep(1.5)
+            return
+    wda.tap_xy(sid, 230, 800)
+    time.sleep(1.5)
+
+
+def open_moments(sid: str) -> None:
+    """From 发现 tab, tap 朋友圈 row."""
+    ensure_discover_tab(sid)
+    row = wda.find(sid, '(name == "朋友圈" OR label == "朋友圈") AND type == "XCUIElementTypeStaticText"')
+    if not row:
+        raise WeChatError(3, "no 朋友圈 entry on 发现 page")
+    r = wda.get_rect(sid, row)
+    if not (100 < r.get("y", 0) < 400):
+        raise WeChatError(3, f"朋友圈 element found but at unexpected y={r.get('y')}")
+    wda.tap_xy(sid, 200, r.get("y", 200) + r.get("height", 25) // 2)
+    time.sleep(3.0)
+
+    # Verify by 拍照 button at top-right
+    if not wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "拍照" OR label == "拍照")'):
+        raise WeChatError(3, "朋友圈 didn't open (no 拍照 button visible)")
+
+
+def open_moments_text_editor(sid: str) -> None:
+    """Long-press the 拍照 button to bring up the text-only post editor.
+    This is the standard WeChat path for 纯文字 朋友圈.
+    """
+    cam = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "拍照" OR label == "拍照")')
+    if not cam:
+        raise WeChatError(3, "no 拍照 button on moments page")
+    r = wda.get_rect(sid, cam)
+    cx = r.get("x", 350) + r.get("width", 30) // 2
+    cy = r.get("y", 47) + r.get("height", 30) // 2
+    wda.long_press_xy(sid, cx, cy, 1500)
+    time.sleep(2.5)
+
+    # Verify by 发表 button
+    if not wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "发表" OR label == "发表")'):
+        raise WeChatError(3, "long-press 拍照 did not open text-post editor (no 发表 button)")
+
+
+def post_moments_text(sid: str, text: str) -> None:
+    """In the text-only post editor, type text and tap 发表."""
+    # Keyboard is already up; type directly.
+    wda.type_keys(sid, text)
+    time.sleep(1.5)
+
+    pub = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "发表" OR label == "发表")')
+    if not pub:
+        raise WeChatError(4, "no 发表 button after typing (text too long? UI shift?)")
+    wda.tap_rect_center(sid, pub)
+    time.sleep(3.0)
+
+
+def cmd_moments_post(args: argparse.Namespace) -> int:
+    text = args.text
+    if args.stdin:
+        text = sys.stdin.read().rstrip("\n")
+    if not text:
+        print("wechat-cli moments-post: need TEXT (positional or --stdin)", file=sys.stderr)
+        return 5
+    if len(text) > 2000:
+        print(f"wechat-cli moments-post: text too long ({len(text)} chars); WeChat caps at "
+              f"~2000 for text-only posts", file=sys.stderr)
+        return 5
+
+    if not wda.wda_ready():
+        print("wechat-cli: WDA at :8100 not ready", file=sys.stderr)
+        return 1
+
+    sid = wda.new_session(WECHAT_BUNDLE)
+    if args.verbose:
+        print(f"[moments-post] session={sid[:8]}", file=sys.stderr)
+    try:
+        time.sleep(3.0)
+        check_repair_dialog(sid)
+        open_moments(sid)
+        if args.verbose:
+            print(f"[moments-post] on moments page; long-press 拍照 → text editor", file=sys.stderr)
+        open_moments_text_editor(sid)
+
+        if not args.confirm:
+            print(f"[moments-post] DRY RUN — would now type {len(text)} chars and tap 发表. "
+                  f"Re-run with --confirm to actually post.", file=sys.stderr)
+            # Tap 取消 to back out cleanly
+            cancel = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "取消" OR label == "取消")')
+            if cancel:
+                wda.tap_rect_center(sid, cancel)
+                time.sleep(1.0)
+                # iOS may show "退出此次编辑？" → tap 取消 / 退出
+                exit_btn = wda.find(sid, 'type == "XCUIElementTypeButton" AND (name == "退出" OR name == "不保留")')
+                if exit_btn:
+                    wda.tap_rect_center(sid, exit_btn)
+                    time.sleep(1.0)
+            return 0
+
+        if args.verbose:
+            print(f"[moments-post] typing {len(text)} chars + 发表", file=sys.stderr)
+        post_moments_text(sid, text)
+        if args.verbose:
+            print(f"[moments-post] posted", file=sys.stderr)
+        return 0
+    except WeChatError as e:
+        print(f"wechat-cli moments-post: {e}", file=sys.stderr)
+        return e.code
+    finally:
+        try:
+            ensure_chat_list(sid)
+        except Exception:
+            pass
+        wda.end_session(sid)
+
+
+# ==========================================================================
 # main dispatcher
 # ==========================================================================
 
@@ -467,11 +738,27 @@ def main() -> int:
     pa.add_argument("wx_id", help="wechat ID or 11-digit CN phone")
     pa.add_argument("--msg", help="verification message (ASCII recommended)")
 
+    # del-friend
+    pd = sub.add_parser("del-friend", help="delete a contact (IRREVERSIBLE; default is dry-run)")
+    pd.add_argument("name", help="contact display name (exact match)")
+    pd.add_argument("--confirm", action="store_true",
+                    help="actually delete; without this flag, navigates to confirmation step only")
+
+    # moments-post
+    pm = sub.add_parser("moments-post", help="post a text-only update to 朋友圈 (dry-run unless --confirm)")
+    pm.add_argument("text", nargs="?", help="post body (or use --stdin)")
+    pm.add_argument("--stdin", action="store_true", help="read text from stdin")
+    pm.add_argument("--confirm", action="store_true", help="actually post; default is dry-run")
+
     args = p.parse_args()
     if args.cmd == "send":
         return cmd_send(args)
     if args.cmd == "add-friend":
         return cmd_add_friend(args)
+    if args.cmd == "del-friend":
+        return cmd_del_friend(args)
+    if args.cmd == "moments-post":
+        return cmd_moments_post(args)
     print(f"wechat-cli: unknown command {args.cmd}", file=sys.stderr)
     return 5
 
